@@ -31,7 +31,89 @@ _CPP_SRC = r"""
 #endif
 
 
-### YOUR C++ / OpenMP CODE implementing Attention HERE
+torch::Tensor attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    // Q, K, V in the shape: [B, H, S, D]
+    int B = Q.size(0);
+    int H = Q.size(1);
+    int S = Q.size(2);
+    int D = Q.size(3);
+
+    float scale = 1.0f / std::sqrt((float)D);
+
+    auto P = torch::empty({B, H, S, S}, Q.options());
+    auto A = torch::empty({B, H, S, S}, Q.options());
+    auto O = torch::zeros({B, H, S, D}, Q.options());
+
+    const float* q = Q.data_ptr<float>();
+    const float* k = K.data_ptr<float>();
+    const float* v = V.data_ptr<float>();
+    float* p = P.data_ptr<float>();
+    float* a = A.data_ptr<float>();
+    float* o = O.data_ptr<float>();
+
+    
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            int bh = b * H + h;
+
+            // Pointers to this batch+head slice
+            const float* Q_bh = q + bh * S * D;
+            const float* K_bh = k + bh * S * D;
+            const float* V_bh = v + bh * S * D;
+            float*       P_bh = p + bh * S * S;
+            float*       A_bh = a + bh * S * S;
+            float*       O_bh = o + bh * S * D;
+
+            // Step 1: P = Q * K^T / sqrt(D)
+            for (int i = 0; i < S; i++) {
+                for (int j = 0; j < S; j++) {
+                    float sum = 0.0f;
+                    for (int d = 0; d < D; d++) {
+                        sum += Q_bh[i * D + d] * K_bh[j * D + d];
+                    }
+                    P_bh[i * S + j] = sum * scale;
+                }
+            }
+
+            // Step 2: A = softmax(P) row-wise
+            for (int i = 0; i < S; i++) {
+                float* row_p = P_bh + i * S;
+                float* row_a = A_bh + i * S;
+
+                // Finding max for teh stability
+                float row_max = -FLT_MAX;
+                for (int j = 0; j < S; j++) {
+                    if (row_p[j] > row_max) row_max = row_p[j];
+                }
+
+                // Computation for exp and sum
+                float row_sum = 0.0f;
+                for (int j = 0; j < S; j++) {
+                    row_a[j] = std::exp(row_p[j] - row_max);
+                    row_sum += row_a[j];
+                }
+
+                // Normalization
+                for (int j = 0; j < S; j++) {
+                    row_a[j] /= row_sum;
+                }
+            }
+
+            // Step 3: O = A * V
+            for (int i = 0; i < S; i++) {
+                for (int d = 0; d < D; d++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < S; j++) {
+                        sum += A_bh[i * S + j] * V_bh[j * D + d];
+                    }
+                    O_bh[i * D + d] = sum;
+                }
+            }
+        }
+    }
+
+    return O;
+}
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,7 +135,7 @@ _attn_ext = load_inline(
     name="attn_cpu_ext",
     cpp_sources=_CPP_SRC,  # full C++ source — no cuda_sources for CPU
     functions=["attention_forward"],
-    extra_compile_args={"cxx": ["-O3", "-fopenmp", "-march=native", "-g"]},
+    extra_cflags=["/O2", "/openmp"],
     # macOS: Apple clang does not bundle OpenMP.
     #   Install it first:  brew install libomp
     #   Then replace the flags above with:
